@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  telegram-podcast-bot:
+    build: .
+    volumes:
+      - ./.env:/app/.env
+      - ./sessions:/app/sessions
+      - ./output:/app/output
+      - ./speakers:/app/speakers
+    environment:
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1  # Prevent Python from buffering stdout/stderr
+    stdin_open: true        # Keep STDIN open
+    tty: true               # Allocate a pseudo-TTY
+    restart: "no"           # Don't restart on exit during authentication
+    # Use deploy instead of resource limits (more modern approach)
+    deploy:
+      resources:
+        reservations:
+          memory: 1G
+        limits:
+          memory: 4G 

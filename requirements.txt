@@ -1,6 +1,11 @@
 telethon
 openai>=1.0.0
-git+https://github.com/idiap/coqui-ai-TTS.git
+git+https://github.com/idiap/coqui-ai-TTS.git#egg=coqui-tts[all]
 python-dotenv>=1.0.0
 langdetect>=1.0.9
 gtts>=2.3.2
+pydub>=0.25.1
+# Avoiding the spacy[ja] dependency to make installation easier
+# If you need Japanese support, uncomment the line below
+# spacy[ja]>=3.8.0
+scipy

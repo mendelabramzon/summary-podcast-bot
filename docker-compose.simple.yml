@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  telegram-podcast-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.simple
+    volumes:
+      - ./.env:/app/.env
+      - ./sessions:/app/sessions
+      - ./output:/app/output
+    environment:
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1  # Prevent Python from buffering stdout/stderr
+    stdin_open: true        # Keep STDIN open
+    tty: true               # Allocate a pseudo-TTY
+    restart: "no"           # Don't restart on exit during authentication 

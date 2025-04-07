@@ -1,6 +1,8 @@
 import os
 import asyncio
 import datetime
+import re
+import sys
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Message
@@ -9,6 +11,10 @@ from openai import OpenAI
 from TTS.api import TTS  # Coqui TTS
 import langdetect  # For language detection
 from gtts import gTTS  # Google Text-to-Speech as a fallback
+from pydub import AudioSegment
+import random
+import glob
+import numpy as np
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,7 +27,11 @@ load_dotenv()
 API_ID = os.environ.get("TELEGRAM_API_ID")         # e.g., "123456"
 API_HASH = os.environ.get("TELEGRAM_API_HASH")       # e.g., "abcdef123456..."
 PHONE_NUMBER = os.environ.get("TELEGRAM_PHONE_NUMBER")  # e.g., "+1234567890"
-SESSION_NAME = "telegram_session"
+SESSION_NAME = os.path.join("sessions", "telegram_session")
+
+# Ensure output directory exists
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # OpenAI configuration
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -132,69 +142,247 @@ def generate_multi_topic_summary(topics_summaries: dict, language: str = "en") -
     
     return response.choices[0].message.content
 
-def synthesize_speech_with_coqui(text: str, language: str = "en", output_filename: str = "podcast_summary.wav") -> str:
+def synthesize_speech_with_coqui(text: str, language: str = "en", output_filename: str = None) -> str:
     """
-    Converts the given text to natural-sounding speech using Coqui TTS.
-    This uses a pre-trained model that can be run locally without cloud credentials.
-    Falls back to Google TTS for Russian if needed.
+    Converts the given text to natural-sounding speech using multiple voices for different speakers.
+    Uses Coqui TTS with different speaker IDs for different characters.
+    Properly handles punctuation to make speech sound more natural.
     """
-    try:
-        # For Russian, try Google TTS first as it has reliable Russian support
-        if language == "ru":
-            try:
-                print("Using Google TTS for Russian language")
-                # Google TTS uses MP3 format
-                mp3_output = output_filename.replace(".wav", ".mp3")
-                gtts = gTTS(text=text, lang='ru', slow=False)
-                gtts.save(mp3_output)
-                print(f"Speech synthesized using Google TTS and saved to {mp3_output}")
-                return mp3_output
-            except Exception as e:
-                print(f"Google TTS failed: {e}")
-                print("Falling back to Coqui TTS models...")
-                # Continue with Coqui TTS fallbacks
+    if output_filename is None:
+        output_filename = os.path.join(OUTPUT_DIR, "podcast_summary.wav")
+    else:
+        output_filename = os.path.join(OUTPUT_DIR, output_filename)
         
-        # Original Coqui TTS logic
-        # Select appropriate TTS model based on language
+    try:
+        # Extract different speakers and their lines from the text
+        # Basic pattern: "Speaker Name: Their dialogue"
+        speaker_pattern = re.compile(r'([^:]+):\s*(.*?)(?=\n[^:]+:|$)', re.DOTALL)
+        segments = speaker_pattern.findall(text)
+        
+        if not segments:
+            # If no clear speaker segments found, process as a single voice
+            print("No distinct speakers found, using single voice")
+            segments = [("Narrator", text)]
+            
+        # First make sure we have a reference voice file
+        ref_voice_path = os.path.join("speakers", "voice1.wav")
+        if not os.path.exists(ref_voice_path):
+            # Create a directory for speakers
+            os.makedirs("speakers", exist_ok=True)
+            print(f"WARNING: Reference voice file not found at {ref_voice_path}")
+            print("Falling back to Google TTS...")
+            return synthesize_with_google_tts(segments, language, output_filename)
+        else:
+            print(f"Found reference voice file: {ref_voice_path}")
+        
+        # Load appropriate TTS model based on language
         if language == "ru":
-            # Try different approaches for Russian language
             try:
-                # First attempt with a multi-language model that might support Russian
+                # First attempt with a multi-language model that supports Russian
                 tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=True, gpu=False)
                 print("Using multilingual XTTS model for Russian")
             except Exception as e:
                 print(f"Couldn't load multilingual XTTS model: {e}")
-                # Fall back to YourTTS which has broader language support
                 try:
                     tts = TTS(model_name="tts_models/multilingual/multi-dataset/your_tts", progress_bar=True, gpu=False)
                     print("Using YourTTS model for Russian")
                 except Exception as e:
                     print(f"Couldn't load YourTTS model: {e}")
-                    # Ultimate fallback to English model
-                    print("Falling back to English model for Russian text")
-                    tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
+                    # Fallback to Google TTS for Russian
+                    return synthesize_with_google_tts(segments, language, output_filename)
         else:
-            # Default English model
-            tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
+            # For English, try to use a model with multiple speaker support
+            try:
+                # Try XTTS for English too as it has better multi-speaker support
+                tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=True, gpu=False)
+                print("Using XTTS model for English with multiple speakers")
+            except Exception as e:
+                print(f"Couldn't load XTTS model: {e}")
+                try:
+                    # Try another model with speaker diversity
+                    tts = TTS(model_name="tts_models/en/vctk/vits", progress_bar=True, gpu=False)
+                    print("Using VCTK model with multiple speakers")
+                except Exception as e:
+                    print(f"Couldn't load VCTK model: {e}")
+                    try:
+                        # Fallback to basic model
+                        tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=True, gpu=False)
+                        print("Using LJSpeech model (limited voice variety)")
+                    except Exception as e:
+                        print(f"Couldn't load any Coqui TTS model: {e}")
+                        # Final fallback to Google TTS
+                        return synthesize_with_google_tts(segments, language, output_filename)
         
-        # Convert text to speech and save as a WAV file.
-        tts.tts_to_file(text=text, file_path=output_filename)
-        return output_filename
+        # Process each segment with a different voice
+        audio_segments = []
+        
+        for i, (speaker, line) in enumerate(segments):
+            speaker_name = speaker.strip()
+            
+            # Clean the text to avoid reading punctuation
+            clean_text = clean_text_for_tts(line)
+            if not clean_text.strip():
+                continue
+            
+            # Create a unique output file for this segment
+            segment_filename = f"segment_{i}.wav"
+            
+            # Check model type and use appropriate method
+            if "xtts" in tts.model_name:
+                try:
+                    # Explicitly use the reference voice file for XTTS
+                    print(f"Using reference voice: {ref_voice_path}")
+                    tts.tts_to_file(
+                        text=clean_text, 
+                        file_path=segment_filename,
+                        speaker_wav=ref_voice_path,
+                        language=language[:2]  # Use first 2 chars of language code
+                    )
+                except Exception as e:
+                    print(f"XTTS synthesis failed: {e}, skipping to next segment")
+                    continue
+            elif hasattr(tts, "speakers") and tts.speakers:
+                # For models with built-in speaker support
+                speaker_id = tts.speakers[i % len(tts.speakers)]
+                try:
+                    tts.tts_to_file(text=clean_text, file_path=segment_filename, speaker=speaker_id)
+                except Exception as e:
+                    print(f"Speaker-based TTS failed: {e}, trying default")
+                    tts.tts_to_file(text=clean_text, file_path=segment_filename)
+            else:
+                # Basic TTS without speaker support
+                tts.tts_to_file(text=clean_text, file_path=segment_filename)
+            
+            # Add to our collection of segments
+            audio_segments.append(segment_filename)
+        
+        # Combine all audio segments into one file
+        combined_audio = combine_audio_segments(audio_segments, output_filename)
+        
+        # Clean up temporary files
+        for segment_file in audio_segments:
+            if os.path.exists(segment_file):
+                os.remove(segment_file)
+        
+        return combined_audio
+    
     except Exception as e:
         print(f"Error synthesizing speech with Coqui TTS: {e}")
-        print("Trying Google TTS as a final fallback...")
+        print("Falling back to Google TTS...")
         try:
-            # Use Google TTS as a final fallback
-            lang_code = 'ru' if language == 'ru' else 'en'
-            mp3_output = output_filename.replace(".wav", ".mp3")
-            gtts = gTTS(text=text, lang=lang_code, slow=False)
-            gtts.save(mp3_output)
-            print(f"Speech synthesized using Google TTS fallback and saved to {mp3_output}")
-            return mp3_output
+            return synthesize_with_google_tts(segments if 'segments' in locals() else [(None, text)], language, output_filename)
         except Exception as e2:
             print(f"Google TTS fallback also failed: {e2}")
             print("Unable to synthesize speech. Returning empty file path.")
             return ""
+
+def synthesize_with_google_tts(segments, language, output_filename):
+    """
+    Fallback to Google TTS when Coqui fails.
+    Attempts to use different voices for different speakers.
+    """
+    print("Using Google TTS for speech synthesis")
+    
+    # Google TTS uses MP3 format
+    mp3_output = output_filename.replace(".wav", ".mp3")
+    
+    if len(segments) > 1:
+        # Multiple speakers
+        audio_segments = []
+        
+        for i, (speaker, line) in enumerate(segments):
+            if not line.strip():
+                continue
+                
+            # Clean the text to avoid reading punctuation
+            clean_text = clean_text_for_tts(line)
+            if not clean_text.strip():
+                continue
+            
+            # Create a temporary file for this segment
+            segment_file = os.path.join(OUTPUT_DIR, f"temp_segment_{i}.mp3")
+            
+            # Get language code for TTS
+            lang_code = 'ru' if language == 'ru' else 'en'
+            
+            # Create a "different" voice by slightly adjusting speed/pitch
+            # This is a simple approach since Google TTS has limited voice options
+            tld = random.choice(['com', 'co.uk', 'com.au', 'ca', 'co.in']) if lang_code == 'en' else 'com'
+            
+            # Generate speech for this segment
+            gtts = gTTS(text=clean_text, lang=lang_code, tld=tld, slow=False)
+            gtts.save(segment_file)
+            
+            audio_segments.append(segment_file)
+        
+        # Combine all audio segments
+        combined_audio = combine_audio_segments(audio_segments, mp3_output, format="mp3")
+        
+        # Clean up temporary files
+        for segment_file in audio_segments:
+            if os.path.exists(segment_file):
+                os.remove(segment_file)
+        
+        return combined_audio
+    else:
+        # Single speaker case
+        clean_text = clean_text_for_tts(segments[0][1]) if segments else text
+        lang_code = 'ru' if language == 'ru' else 'en'
+        gtts = gTTS(text=clean_text, lang=lang_code, slow=False)
+        gtts.save(mp3_output)
+        print(f"Speech synthesized using Google TTS and saved to {mp3_output}")
+        return mp3_output
+
+def clean_text_for_tts(text):
+    """
+    Clean text to improve TTS naturalness.
+    - Replace punctuation with appropriate pauses
+    - Format text to sound more natural when spoken
+    """
+    # Replace multiple newlines with a single one
+    text = re.sub(r'\n+', '\n', text)
+    
+    # Add pauses for better speech rhythm
+    text = re.sub(r'([.!?])\s+', r'\1\n', text)  # Add newline after sentence endings
+    
+    # Remove unnecessary characters that TTS may try to verbalize
+    text = re.sub(r'["\'""'']', '', text)  # Remove quotes that might be read
+    text = re.sub(r'[*_~]', '', text)  # Remove markdown characters
+    
+    # Convert dashes to commas for better phrasing
+    text = re.sub(r'\s-\s', ', ', text)
+    
+    # Add subtle pauses for parenthetical content
+    text = re.sub(r'\(', ', ', text)
+    text = re.sub(r'\)', ', ', text)
+    
+    return text
+
+def combine_audio_segments(segment_files, output_file, format="wav"):
+    """
+    Combines multiple audio segments into a single file.
+    Adds short pauses between speaker segments for natural conversation flow.
+    """
+    combined = AudioSegment.empty()
+    
+    for i, segment_file in enumerate(segment_files):
+        if not os.path.exists(segment_file):
+            continue
+            
+        # Load the audio segment
+        segment = AudioSegment.from_file(segment_file)
+        
+        # Add a short pause between speakers (but not before the first one)
+        if i > 0:
+            pause = AudioSegment.silent(duration=700)  # 700ms pause
+            combined += pause
+        
+        # Add this segment to the combined audio
+        combined += segment
+    
+    # Export the combined audio
+    combined.export(output_file, format=format)
+    return output_file
 
 def parse_date(date_str: str) -> datetime.datetime:
     """
@@ -511,10 +699,66 @@ def list_available_tts_models():
 # ---------------------------
 
 async def main():
-    # Initialize and start the Telegram client as a userbot.
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start(phone=PHONE_NUMBER)
+    # Print a clear header for better visibility in Docker logs
+    print("\n" + "*"*70)
+    print("*" + " "*26 + "TELEGRAM BOT STARTUP" + " "*26 + "*")
+    print("*"*70 + "\n")
     
+    # Verify environment variables
+    if not all([API_ID, API_HASH, PHONE_NUMBER]):
+        print("ERROR: Missing Telegram credentials in environment variables!")
+        print("Please check your .env file contains:")
+        print("  TELEGRAM_API_ID")
+        print("  TELEGRAM_API_HASH")
+        print("  TELEGRAM_PHONE_NUMBER")
+        sys.exit(1)
+
+    # Initialize the Telegram client
+    print(f"Initializing Telegram client with phone: {PHONE_NUMBER}")
+    print(f"Session will be stored at: {SESSION_NAME}")
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+    # Connect and handle authentication explicitly
+    print("\nConnecting to Telegram...")
+    await client.connect()
+    
+    # Check if already authenticated
+    if not await client.is_user_authorized():
+        print("\n" + "="*50)
+        print("AUTHENTICATION REQUIRED")
+        print("="*50)
+        print("You need to authenticate with Telegram.")
+        print("A verification code will be sent to your Telegram account.")
+        print("="*50 + "\n")
+        
+        try:
+            # Request verification code
+            print("Requesting verification code...")
+            await client.send_code_request(PHONE_NUMBER)
+            
+            # Make the input prompt very visible
+            print("\n" + "!"*50)
+            print("! PLEASE CHECK YOUR TELEGRAM APP FOR THE VERIFICATION CODE !")
+            print("!"*50 + "\n")
+            
+            # Use a large timeout to make sure we don't miss user input
+            code = input("Enter the code you received: ")
+            print(f"Received code: {code}")
+            
+            # Sign in with the code
+            print("Signing in with provided code...")
+            await client.sign_in(PHONE_NUMBER, code)
+            print("\nSuccessfully authenticated with Telegram!")
+        except Exception as e:
+            print(f"\nError during authentication: {e}")
+            print("Please try running the container again.")
+            await client.disconnect()
+            sys.exit(1)
+    else:
+        print("Already authenticated with Telegram!")
+
+    print("\nStarting bot operation...\n")
+
     # List available TTS models (helpful for debugging)
     list_available_tts_models()
     
@@ -560,9 +804,10 @@ async def main():
         print("Summary generated")
     
     # Save the summary to a file for reference
-    with open("podcast_summary.txt", "w", encoding="utf-8") as f:
+    summary_file = os.path.join(OUTPUT_DIR, "podcast_summary.txt")
+    with open(summary_file, "w", encoding="utf-8") as f:
         f.write(summary)
-    print("Summary saved to podcast_summary.txt")
+    print(f"Summary saved to {summary_file}")
     
     # Determine language for TTS (use the detected language from earlier steps)
     language = primary_language if isinstance(chat_content, dict) else language
