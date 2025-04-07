@@ -51,3 +51,4 @@ build/
 # OS specific
 .DS_Store
 Thumbs.db 
+podcast_summary.txt

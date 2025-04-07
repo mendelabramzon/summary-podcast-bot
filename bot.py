@@ -3,6 +3,8 @@ import asyncio
 import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from telethon.tl.types import Channel, Message
+from telethon.tl.functions.channels import GetForumTopicsRequest
 from openai import OpenAI
 from TTS.api import TTS  # Coqui TTS
 import langdetect  # For language detection
@@ -44,16 +46,19 @@ def detect_language(text: str) -> str:
         print(f"Language detection failed: {e}")
         return "en"  # Default to English if detection fails
 
-def generate_summary(chat_text: str, language: str = "en") -> str:
+def generate_summary(chat_text: str, language: str = "en", topic_name: str = None) -> str:
     """
     Generates a podcast-style summary using OpenAI's GPT-3.5-turbo.
     The prompt instructs the model to produce a script that would last 5-10 minutes.
     Includes information about participants and their main points/theses.
+    
+    If topic_name is provided, it will be included in the prompt to provide context.
     """
-    # Adjust system prompt based on detected language
+    # Adjust system prompt based on detected language and whether there's a topic
     if language == "ru":
+        topic_context = f" по теме '{topic_name}'" if topic_name else ""
         system_prompt = (
-            "Вы - эксперт по написанию подкастов. Обобщите следующую чат-беседу "
+            f"Вы - эксперт по написанию подкастов. Обобщите следующую чат-беседу{topic_context} "
             "в четкий, увлекательный сценарий подкаста, который будет длиться около 5-10 минут при "
             "чтении вслух. Сценарий должен быть разговорным и естественным. "
             "Обязательно включите следующие детали:\n"
@@ -63,8 +68,9 @@ def generate_summary(chat_text: str, language: str = "en") -> str:
             "Пожалуйста, создайте сценарий на русском языке."
         )
     else:
+        topic_context = f" on the topic '{topic_name}'" if topic_name else ""
         system_prompt = (
-            "You are an expert podcast script writer. Summarize the following chat conversation "
+            f"You are an expert podcast script writer. Summarize the following chat conversation{topic_context} "
             "into a clear, engaging podcast script that would last about 5-10 minutes when read aloud. "
             "The script should be conversational and natural. "
             "Be sure to include these specific details:\n"
@@ -80,6 +86,48 @@ def generate_summary(chat_text: str, language: str = "en") -> str:
             {"role": "user", "content": chat_text},
         ],
         max_tokens=1500  # Adjust this based on desired summary length
+    )
+    
+    return response.choices[0].message.content
+
+def generate_multi_topic_summary(topics_summaries: dict, language: str = "en") -> str:
+    """
+    Generates a consolidated summary for multiple topics.
+    Takes a dictionary of {topic_name: summary} and creates a cohesive podcast script.
+    """
+    # Create a prompt for generating a consolidated summary
+    if language == "ru":
+        system_prompt = (
+            "Вы - эксперт по написанию подкастов. Перед вами несколько кратких обзоров "
+            "по разным темам из одного чата. Объедините их в единый согласованный сценарий подкаста, "
+            "который представляет все эти темы в логической последовательности. "
+            "Сценарий должен иметь четкое введение, представляющее общий контекст чата, "
+            "а затем переходить к каждой теме, прежде чем завершиться кратким заключением. "
+            "Сохраните ключевые детали и основные моменты из каждого обзора темы.\n"
+            "Пожалуйста, создайте сценарий на русском языке."
+        )
+    else:
+        system_prompt = (
+            "You are an expert podcast script writer. You are given several summaries "
+            "for different topics from the same chat. Combine them into a single cohesive podcast script "
+            "that presents all these topics in a logical sequence. "
+            "The script should have a clear introduction presenting the overall context of the chat, "
+            "then transition to each topic, before concluding with a brief wrap-up. "
+            "Preserve the key details and main points from each topic summary.\n"
+        )
+    
+    # Build the content with topic summaries
+    content = "Here are the summaries for each topic:\n\n"
+    for topic, summary in topics_summaries.items():
+        content += f"TOPIC: {topic}\n{summary}\n\n"
+    
+    response = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=2000  # Increased token limit for the combined summary
     )
     
     return response.choices[0].message.content
@@ -170,10 +218,125 @@ def parse_date(date_str: str) -> datetime.datetime:
     
     raise ValueError(f"Could not parse date: {date_str}. Please use format YYYY-MM-DD.")
 
+async def check_if_forum(client: TelegramClient, entity) -> bool:
+    """
+    Check if a chat is a forum (has topics).
+    """
+    if not isinstance(entity, Channel):
+        return False
+    
+    try:
+        # Try to get forum topics - this will fail if it's not a forum
+        topics = await client(GetForumTopicsRequest(
+            channel=entity,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=1
+        ))
+        return True
+    except Exception:
+        return False
+
+async def get_forum_topics(client: TelegramClient, entity) -> list:
+    """
+    Retrieves the list of topics in a forum chat.
+    """
+    try:
+        topics = await client(GetForumTopicsRequest(
+            channel=entity,
+            offset_date=0,
+            offset_id=0,
+            offset_topic=0,
+            limit=100  # Fetch up to 100 topics
+        ))
+        return topics.topics
+    except Exception as e:
+        print(f"Error fetching forum topics: {e}")
+        return []
+
+async def fetch_topic_messages(client: TelegramClient, chat_id, topic_id, limit, start_date=None, end_date=None) -> list:
+    """
+    Fetches messages from a specific topic in a forum chat.
+    """
+    messages = []
+    
+    # For date filtering with topics
+    if start_date or end_date:
+        batch_size = min(100, limit)
+        total_collected = 0
+        offset_id = 0
+        
+        while total_collected < limit:
+            batch = await client.get_messages(
+                chat_id, 
+                limit=batch_size, 
+                offset_id=offset_id,
+                reply_to=topic_id  # This filters by topic
+            )
+            
+            if not batch:
+                break  # No more messages
+            
+            for msg in batch:
+                if msg.date is None:
+                    continue
+                    
+                msg_datetime = msg.date.replace(tzinfo=None)  # Remove timezone for comparison
+                
+                # Check if message is within date range
+                is_after_start = True if start_date is None else msg_datetime >= start_date
+                is_before_end = True if end_date is None else msg_datetime <= end_date
+                
+                if is_after_start and is_before_end and msg.message:
+                    messages.append(msg)
+                    total_collected += 1
+                    if total_collected >= limit:
+                        break
+            
+            if len(batch) < batch_size:
+                break  # No more messages to fetch
+                
+            offset_id = batch[-1].id
+    else:
+        # Simple case without date filtering
+        messages = await client.get_messages(
+            chat_id, 
+            limit=limit,
+            reply_to=topic_id  # This filters by topic
+        )
+    
+    # Sort messages by date (oldest first)
+    messages.sort(key=lambda msg: msg.date)
+    return messages
+
+def extract_message_text(messages: list) -> str:
+    """
+    Extracts text with sender information from a list of messages.
+    """
+    chat_lines = []
+    for msg in messages:
+        if msg.message:
+            sender = msg.sender
+            sender_name = getattr(sender, 'first_name', '') or ''
+            if hasattr(sender, 'last_name') and sender.last_name:
+                sender_name += ' ' + sender.last_name
+            
+            # If no name is available, try using username or id
+            if not sender_name and hasattr(sender, 'username') and sender.username:
+                sender_name = sender.username
+            elif not sender_name:
+                sender_name = f"User-{sender.id}" if hasattr(sender, 'id') else "Unknown"
+            
+            chat_lines.append(f"{sender_name}: {msg.message}")
+    
+    return "\n".join(chat_lines)
+
 async def fetch_chat_history(client: TelegramClient) -> str:
     """
     Retrieves chat history from a selected chat.
     Lists available chats and allows user to specify message limit and date range.
+    Now supports topics in forum chats.
     """
     dialogs = await client.get_dialogs()
     print("Available chats:")
@@ -183,6 +346,9 @@ async def fetch_chat_history(client: TelegramClient) -> str:
     selected_index = int(input("Enter the index of the chat to summarize: "))
     selected_dialog = dialogs[selected_index]
     chat_id = selected_dialog.id
+    
+    # Check if the selected chat is a forum (has topics)
+    is_forum = await check_if_forum(client, selected_dialog.entity)
     
     # Ask for message limit
     limit_input = input(f"Enter the number of messages to fetch (default: {DEFAULT_MESSAGE_LIMIT}): ")
@@ -216,71 +382,109 @@ async def fetch_chat_history(client: TelegramClient) -> str:
             print("Proceeding without date filtering.")
             use_date_range = False
     
-    # Fetch messages with the specified parameters
-    messages = []
-    
-    if use_date_range:
-        # When using date range, we might need to fetch more messages to get enough within the range
-        # We'll fetch in batches to avoid hitting limits
-        batch_size = min(100, limit)
-        total_collected = 0
-        offset_id = 0
+    # Handle differently based on whether it's a forum or regular chat
+    if is_forum:
+        print("This is a forum chat with topics!")
+        topics = await get_forum_topics(client, selected_dialog.entity)
         
-        while total_collected < limit:
-            batch = await client.get_messages(chat_id, limit=batch_size, offset_id=offset_id)
-            if not batch:
-                break  # No more messages
+        if not topics:
+            print("No topics found in this forum.")
+            return ""
+        
+        print("Available topics:")
+        for i, topic in enumerate(topics):
+            # Skip the default "General" topic (0) in listing
+            if topic.id != 0:
+                print(f"{i}: {topic.title}")
+        
+        # Allow selecting all topics or specific ones
+        topic_selection = input("Enter topic numbers to summarize (comma-separated), or 'all' for all topics: ")
+        
+        if topic_selection.lower() == 'all':
+            selected_topics = [topic for topic in topics if topic.id != 0]  # Skip "General" topic
+        else:
+            topic_indices = [int(idx.strip()) for idx in topic_selection.split(',')]
+            selected_topics = [topics[idx] for idx in topic_indices]
+        
+        topic_summaries = {}
+        
+        for topic in selected_topics:
+            print(f"Fetching messages for topic: {topic.title}")
             
-            for msg in batch:
-                if msg.date is None:
-                    continue
-                    
-                msg_datetime = msg.date.replace(tzinfo=None)  # Remove timezone for comparison
-                
-                # Check if message is within date range
-                is_after_start = True if start_date is None else msg_datetime >= start_date
-                is_before_end = True if end_date is None else msg_datetime <= end_date
-                
-                if is_after_start and is_before_end and msg.message:
-                    messages.append(msg)
-                    total_collected += 1
-                    if total_collected >= limit:
-                        break
+            # Fetch messages for this topic
+            topic_messages = await fetch_topic_messages(
+                client, chat_id, topic.id, limit, start_date, end_date
+            )
             
-            if len(batch) < batch_size:
-                break  # No more messages to fetch
+            if not topic_messages:
+                print(f"No messages found in topic '{topic.title}'")
+                continue
+            
+            # Extract text from messages
+            topic_text = extract_message_text(topic_messages)
+            
+            if not topic_text.strip():
+                print(f"No text content found in topic '{topic.title}'")
+                continue
                 
-            offset_id = batch[-1].id
+            topic_summaries[topic.title] = topic_text
+            print(f"Fetched {len(topic_messages)} messages from topic '{topic.title}'")
+        
+        if not topic_summaries:
+            print("No messages found in any of the selected topics.")
+            return ""
+            
+        return topic_summaries
     else:
-        # Simple case: just fetch the requested number of messages
-        messages = await client.get_messages(chat_id, limit=limit)
-    
-    # Sort messages by date (oldest first)
-    messages.sort(key=lambda msg: msg.date)
-    
-    # Extract message text with sender information
-    chat_lines = []
-    for msg in messages:
-        if msg.message:
-            sender = msg.sender
-            sender_name = getattr(sender, 'first_name', '') or ''
-            if hasattr(sender, 'last_name') and sender.last_name:
-                sender_name += ' ' + sender.last_name
+        # Regular chat (no topics) - use existing logic
+        messages = []
+        
+        if use_date_range:
+            # When using date range, we might need to fetch more messages to get enough within the range
+            # We'll fetch in batches to avoid hitting limits
+            batch_size = min(100, limit)
+            total_collected = 0
+            offset_id = 0
             
-            # If no name is available, try using username or id
-            if not sender_name and hasattr(sender, 'username') and sender.username:
-                sender_name = sender.username
-            elif not sender_name:
-                sender_name = f"User-{sender.id}" if hasattr(sender, 'id') else "Unknown"
-            
-            chat_lines.append(f"{sender_name}: {msg.message}")
-    
-    chat_text = "\n".join(chat_lines)
-    
-    print(f"Fetched {len(messages)} messages" + 
-          (f" from {start_date} to {end_date}" if use_date_range else ""))
-    
-    return chat_text
+            while total_collected < limit:
+                batch = await client.get_messages(chat_id, limit=batch_size, offset_id=offset_id)
+                if not batch:
+                    break  # No more messages
+                
+                for msg in batch:
+                    if msg.date is None:
+                        continue
+                        
+                    msg_datetime = msg.date.replace(tzinfo=None)  # Remove timezone for comparison
+                    
+                    # Check if message is within date range
+                    is_after_start = True if start_date is None else msg_datetime >= start_date
+                    is_before_end = True if end_date is None else msg_datetime <= end_date
+                    
+                    if is_after_start and is_before_end and msg.message:
+                        messages.append(msg)
+                        total_collected += 1
+                        if total_collected >= limit:
+                            break
+                
+                if len(batch) < batch_size:
+                    break  # No more messages to fetch
+                    
+                offset_id = batch[-1].id
+        else:
+            # Simple case: just fetch the requested number of messages
+            messages = await client.get_messages(chat_id, limit=limit)
+        
+        # Sort messages by date (oldest first)
+        messages.sort(key=lambda msg: msg.date)
+        
+        # Extract message text with sender information
+        chat_text = extract_message_text(messages)
+        
+        print(f"Fetched {len(messages)} messages" + 
+              (f" from {start_date} to {end_date}" if use_date_range else ""))
+        
+        return chat_text
 
 def list_available_tts_models():
     """
@@ -315,20 +519,53 @@ async def main():
     list_available_tts_models()
     
     print("Retrieving chat history...")
-    chat_text = await fetch_chat_history(client)
+    chat_content = await fetch_chat_history(client)
     
-    if not chat_text.strip():
+    if not chat_content:
         print("No text messages found in the selected chat.")
         await client.disconnect()
         return
     
-    # Detect the language of the chat
-    language = detect_language(chat_text)
-    print(f"Detected language: {language}")
+    # Handle forum topics differently than regular chats
+    if isinstance(chat_content, dict):  # It's a forum with topics
+        print("Processing summaries for each topic...")
+        topic_summaries = {}
+        
+        # For each topic, generate a separate summary
+        for topic_name, messages_text in chat_content.items():
+            # Detect language for each topic
+            language = detect_language(messages_text)
+            print(f"Topic '{topic_name}' detected language: {language}")
+            
+            # Generate summary for this topic
+            print(f"Generating summary for topic '{topic_name}'...")
+            topic_summary = generate_summary(messages_text, language, topic_name)
+            topic_summaries[topic_name] = topic_summary
+        
+        # Create a combined summary across all topics
+        print("Generating consolidated podcast script from all topics...")
+        
+        # Use the language from the first topic as the primary language
+        primary_language = detect_language(list(chat_content.values())[0])
+        summary = generate_multi_topic_summary(topic_summaries, primary_language)
+        
+        print("Consolidated summary generated")
+    else:  # Regular chat without topics
+        # Detect the language of the chat
+        language = detect_language(chat_content)
+        print(f"Detected language: {language}")
+        
+        print("Generating podcast-style summary...")
+        summary = generate_summary(chat_content, language)
+        print("Summary generated")
     
-    print("Generating podcast-style summary...")
-    summary = generate_summary(chat_text, language)
-    print("Summary generated:\n", summary)
+    # Save the summary to a file for reference
+    with open("podcast_summary.txt", "w", encoding="utf-8") as f:
+        f.write(summary)
+    print("Summary saved to podcast_summary.txt")
+    
+    # Determine language for TTS (use the detected language from earlier steps)
+    language = primary_language if isinstance(chat_content, dict) else language
     
     print(f"Synthesizing speech for the podcast using TTS (Language: {language})...")
     podcast_file = synthesize_speech_with_coqui(summary, language)
