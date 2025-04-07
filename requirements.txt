@@ -2,3 +2,5 @@ telethon
 openai>=1.0.0
 git+https://github.com/idiap/coqui-ai-TTS.git
 python-dotenv>=1.0.0
+langdetect>=1.0.9
+gtts>=2.3.2
